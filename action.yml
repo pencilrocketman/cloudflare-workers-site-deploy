@@ -1,0 +1,168 @@
+name: Cloudflare Workers site deploy
+description: Deploy static files to a Cloudflare Worker that is protected by Cloudflare Access (email allow-list) from the first request.
+
+inputs:
+  cloudflare_api_token:
+    description: "Cloudflare API token. Needs: Account > Workers Scripts > Edit, Account > Access: Apps and Policies > Edit, User > User Details > Read."
+    required: true
+  cloudflare_account_id:
+    description: Cloudflare account ID.
+    required: true
+  r2_access_key_id:
+    description: R2 access key ID for the Terraform state bucket.
+    required: true
+  r2_secret_access_key:
+    description: R2 secret access key for the Terraform state bucket.
+    required: true
+  tf_state_bucket:
+    description: R2 bucket name that stores Terraform state.
+    required: true
+  allowed_emails:
+    description: Extra emails allowed through Access (newline or comma separated). The API token owner is always allowed.
+    required: false
+    default: ""
+  worker_name:
+    description: Worker name. Defaults to the repository name.
+    required: false
+    default: ""
+  assets_dir:
+    description: Directory (relative to the workspace) to deploy. Check out (and build) before this action.
+    required: false
+    default: public
+  session_duration:
+    description: Access session duration.
+    required: false
+    default: 24h
+
+outputs:
+  worker_name:
+    description: Deployed Worker name.
+    value: ${{ steps.prepare.outputs.worker_name }}
+  url:
+    description: URL of the deployed site.
+    value: ${{ steps.prepare.outputs.url }}
+
+runs:
+  using: composite
+  steps:
+    - name: Prepare
+      id: prepare
+      shell: bash
+      env:
+        REPO_PRIVATE: ${{ github.event.repository.private }}
+        REPO_NAME: ${{ github.event.repository.name }}
+        CLOUDFLARE_API_TOKEN: ${{ inputs.cloudflare_api_token }}
+        CLOUDFLARE_ACCOUNT_ID: ${{ inputs.cloudflare_account_id }}
+        TF_STATE_BUCKET: ${{ inputs.tf_state_bucket }}
+        INPUT_ALLOWED_EMAILS: ${{ inputs.allowed_emails }}
+        INPUT_WORKER_NAME: ${{ inputs.worker_name }}
+        INPUT_ASSETS_DIR: ${{ inputs.assets_dir }}
+        INPUT_SESSION_DURATION: ${{ inputs.session_duration }}
+      run: |
+        set -euo pipefail
+        fail() { echo "::error::$*"; exit 1; }
+
+        # 許可メールなどの設定がリポジトリに置かれる前提なので、public からは動かさない。
+        [ "$REPO_PRIVATE" = "true" ] \
+          || fail "Deploying is only allowed from private repositories (repository.private=${REPO_PRIVATE:-unknown})."
+
+        # 下で HCL / JSON に埋め込むので、形式を絞って注入を防ぐ。
+        [[ "$CLOUDFLARE_ACCOUNT_ID" =~ ^[0-9a-f]{32}$ ]] || fail "cloudflare_account_id looks invalid."
+        [[ "$TF_STATE_BUCKET" =~ ^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$ ]] || fail "tf_state_bucket looks invalid."
+
+        name=$(printf '%s' "${INPUT_WORKER_NAME:-$REPO_NAME}" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9-]+/-/g; s/^-+//; s/-+$//')
+        [[ "$name" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || fail "Invalid worker name: '$name'."
+
+        [ -d "$GITHUB_WORKSPACE/$INPUT_ASSETS_DIR" ] \
+          || fail "assets_dir '$INPUT_ASSETS_DIR' not found. Run actions/checkout (and your build) before this action."
+        assets_dir=$(cd "$GITHUB_WORKSPACE/$INPUT_ASSETS_DIR" && pwd)
+
+        api() { curl -fsS -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "https://api.cloudflare.com/client/v4$1"; }
+
+        # 許可メールが未設定でも本人だけは見られるように、トークン所有者を常に含める。
+        # 所有者が取れないなら、誰に見せるか決められないので止める (fail closed)。
+        user_json=$(api /user) \
+          || fail "Could not read the API token owner. Use a user API token with 'User Details: Read' (account-owned tokens are not supported)."
+        owner=$(jq -r '.result.email // empty' <<<"$user_json")
+        [ -n "$owner" ] || fail "API token owner has no email."
+
+        sub_json=$(api "/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/subdomain") \
+          || fail "Could not read the account's workers.dev subdomain."
+        subdomain=$(jq -r '.result.subdomain // empty' <<<"$sub_json")
+        [ -n "$subdomain" ] || fail "This account has no workers.dev subdomain yet. Create one in the Cloudflare dashboard."
+        domain="$name.$subdomain.workers.dev"
+
+        emails_json=$(
+          { printf '%s\n' "$owner"; printf '%s\n' "$INPUT_ALLOWED_EMAILS" | tr ',' '\n'; } \
+            | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' | tr '[:upper:]' '[:lower:]' \
+            | { grep -v '^$' || true; } | sort -u | jq -R . | jq -sc .
+        )
+        jq -e 'all(test("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"))' <<<"$emails_json" >/dev/null \
+          || fail "allowed_emails contains an invalid address."
+
+        tf_dir="$RUNNER_TEMP/cwsd-terraform"
+        rm -rf "$tf_dir"
+        cp -R "$GITHUB_ACTION_PATH/terraform" "$tf_dir"
+        jq -n \
+          --arg account_id "$CLOUDFLARE_ACCOUNT_ID" \
+          --arg worker_name "$name" \
+          --arg domain "$domain" \
+          --argjson allowed_emails "$emails_json" \
+          --arg session_duration "$INPUT_SESSION_DURATION" \
+          '$ARGS.named' > "$tf_dir/terraform.tfvars.json"
+        cat > "$tf_dir/backend.hcl" <<EOF
+        bucket    = "$TF_STATE_BUCKET"
+        key       = "cloudflare-workers-site-deploy/$name.tfstate"
+        endpoints = { s3 = "https://$CLOUDFLARE_ACCOUNT_ID.r2.cloudflarestorage.com" }
+        EOF
+
+        {
+          echo "worker_name=$name"
+          echo "url=https://$domain"
+          echo "assets_dir=$assets_dir"
+          echo "tf_dir=$tf_dir"
+        } >> "$GITHUB_OUTPUT"
+
+    - uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: "^1.10.0"
+        terraform_wrapper: false
+
+    # Worker より先に Access を用意し、保護されていない瞬間を作らない。
+    - name: Apply Cloudflare Access
+      shell: bash
+      env:
+        TF_DIR: ${{ steps.prepare.outputs.tf_dir }}
+        CLOUDFLARE_API_TOKEN: ${{ inputs.cloudflare_api_token }}
+        AWS_ACCESS_KEY_ID: ${{ inputs.r2_access_key_id }}
+        AWS_SECRET_ACCESS_KEY: ${{ inputs.r2_secret_access_key }}
+      run: |
+        set -euo pipefail
+        terraform -chdir="$TF_DIR" init -input=false -backend-config="$TF_DIR/backend.hcl"
+        terraform -chdir="$TF_DIR" apply -input=false -auto-approve
+
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 22
+
+    - name: Deploy Worker
+      shell: bash
+      env:
+        WORKER_NAME: ${{ steps.prepare.outputs.worker_name }}
+        ASSETS_DIR: ${{ steps.prepare.outputs.assets_dir }}
+        CLOUDFLARE_API_TOKEN: ${{ inputs.cloudflare_api_token }}
+        CLOUDFLARE_ACCOUNT_ID: ${{ inputs.cloudflare_account_id }}
+      run: |
+        set -euo pipefail
+        # 利用者リポジトリの wrangler 設定は使わない。preview_urls を有効にされると
+        # Access で保護していない URL から閲覧できてしまうため。
+        cfg_dir="$RUNNER_TEMP/cwsd-wrangler"
+        mkdir -p "$cfg_dir"
+        jq -n --arg name "$WORKER_NAME" --arg dir "$ASSETS_DIR" '{
+          name: $name,
+          compatibility_date: "2026-10-01",
+          assets: { directory: $dir },
+          workers_dev: true,
+          preview_urls: false
+        }' > "$cfg_dir/wrangler.json"
+        npx --yes wrangler@4 deploy --config "$cfg_dir/wrangler.json"
