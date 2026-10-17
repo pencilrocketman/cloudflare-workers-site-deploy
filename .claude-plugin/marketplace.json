@@ -1,0 +1,13 @@
+{
+  "name": "cloudflare-workers-site-deploy",
+  "owner": {
+    "name": "pencilrocketman"
+  },
+  "plugins": [
+    {
+      "name": "cloudflare-site",
+      "source": "./plugins/cloudflare-site",
+      "description": "Set up and manage private static sites deployed with cloudflare-workers-site-deploy."
+    }
+  ]
+}
